@@ -27,6 +27,9 @@ object FrameworkPart {
         private set
 
     @Volatile
+    private var provider: ContentProvider? = null
+
+    @Volatile
     var service: DuckService? = null
         private set
 
@@ -48,6 +51,7 @@ object FrameworkPart {
             Logx.e("settings provider not found, framework mode not armed")
             return
         }
+        this.provider = provider
         context = runCatching { provider.context }.getOrNull()
         if (context == null) {
             Logx.e("settings provider has no context, framework mode not armed")
@@ -181,26 +185,102 @@ object FrameworkPart {
                 return
             }
         }
-        f.proceed()
+        try {
+            f.proceed()
+        } catch (t: Throwable) {
+            // The real provider refused this read -- most commonly a restricted-settings
+            // SecurityException, which it throws for both the keys we spoof (adb_enabled and
+            // friends) and plenty of unrelated ones (e.g. bluetooth_name, gated by
+            // targetSdkVersion). Only substitute a value for keys we actually spoof; everything
+            // else must see the exact same single real exception an unhooked call would throw,
+            // not a retried, differently-privileged invocation (see Frame.proceed()).
+            val uid = uidNow ?: throw t
+            if (spoofing() && isTarget(uid)) {
+                val (_, key) = findGetKey(f.args) ?: throw t
+                val spoofed = key?.let { Config.SPOOF_VALUES[it] }
+                if (spoofed != null) {
+                    f.result = Bundle().apply {
+                        putString(Config.CALL_VALUE, spoofed)
+                        putInt(Config.CALL_GENERATION_INDEX, -1)
+                    }
+                    service?.note(uid, key)
+                    Logx.v { "framework spoofed $key for uid $uid (real read was refused)" }
+                    return
+                }
+            }
+            throw t
+        }
         val uid = callingUid() ?: return
         runCatching { spoofCall(uid, f.args, f.result)?.let { f.result = it } }
             .onFailure { Logx.e("framework call spoof failed", it) }
         SpoofRegistry.apply(SpoofRegistry.CALL, uid, f.args, f.result)?.let { f.result = it }
+        runCatching { correctCallArtifact(uid, f.args, f.result) }
+            .onFailure { Logx.e("framework call cross-check failed", it) }
+    }
+
+    // Merely installing an ART-level hook on call() changes what the REAL implementation
+    // returns for keys we never touch: a successful real invocation of GET_secure/global/system
+    // on an unset, unrecognized key answers "0" through this reflectively-invoked backup path,
+    // where the exact same key via query() (also hooked, but apparently unaffected) correctly
+    // answers null. This is a hooking artifact, not real platform behaviour, not a bug in our
+    // own spoofing logic, and it isn't something SPOOF_VALUES is meant to cover. Cross-check
+    // against query() -- proven correct for these keys even while hooked -- and correct call()'s
+    // answer to match whenever they disagree, for any key we don't deliberately spoof ourselves.
+    private fun correctCallArtifact(uid: Int, args: List<Any?>, result: Any?) {
+        if (!spoofing()) return
+        if (!isTarget(uid)) return
+        val (method, key) = findGetKey(args) ?: return
+        if (method !in Config.GET_METHODS || key == null) return
+        if (key in Config.SPOOF_VALUES) return
+        val bundle = result as? Bundle ?: return
+        if (!bundle.containsKey(Config.CALL_VALUE)) return
+        val viaCall = bundle.getString(Config.CALL_VALUE)
+        val viaQuery = realValueViaQuery(method, key) ?: return
+        if (viaCall == viaQuery.value) return
+        if (viaQuery.value == null) {
+            bundle.putString(Config.CALL_VALUE, null)
+        } else {
+            bundle.putString(Config.CALL_VALUE, viaQuery.value)
+        }
+        service?.note(uid, key)
+        Logx.v { "framework corrected a call()-only artifact for $key: '$viaCall' -> '${viaQuery.value}'" }
+    }
+
+    // A thin wrapper so "the real value is null" (Some(null)) is distinguishable from
+    // "the lookup itself failed and we have no ground truth" (null).
+    private class Some<T>(val value: T)
+
+    private fun realValueViaQuery(method: String, key: String): Some<String?>? {
+        val provider = this.provider ?: return null
+        val table = when (method) {
+            "GET_secure" -> "secure"
+            "GET_global" -> "global"
+            "GET_system" -> "system"
+            else -> return null
+        }
+        val uri = Uri.parse("content://${Config.SETTINGS_AUTHORITY}/$table")
+        val cursor = runCatching {
+            provider.query(uri, null, "name=?", arrayOf(key), null)
+        }.getOrNull() ?: return null
+        return cursor.use {
+            val valueIdx = it.getColumnIndex("value")
+            Some(if (valueIdx < 0 || !it.moveToFirst()) null else it.getString(valueIdx))
+        }
+    }
+
+    private fun findGetKey(args: List<Any?>): Pair<String, String?>? {
+        for (i in args.indices) {
+            val a = args[i]
+            if (a is String && (a in Config.GET_METHODS || a in Config.LIST_METHODS)) {
+                return a to (args.getOrNull(i + 1) as? String)
+            }
+        }
+        return null
     }
 
     fun spoofCall(uid: Int, args: List<Any?>, result: Any?): Any? {
         if (!spoofing()) return null
-        var method: String? = null
-        var key: String? = null
-        for (i in args.indices) {
-            val a = args[i]
-            if (a is String && (a in Config.GET_METHODS || a in Config.LIST_METHODS)) {
-                method = a
-                key = args.getOrNull(i + 1) as? String
-                break
-            }
-        }
-        if (method == null) return null
+        val (method, key) = findGetKey(args) ?: return null
         if (!isTarget(uid)) return null
         val bundle = result as? Bundle ?: return null
         if (method in Config.LIST_METHODS) return spoofSettingsList(uid, bundle)
