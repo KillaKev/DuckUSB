@@ -19,6 +19,12 @@ class Frame(
 
     var result: Any? = null
 
+    // Set only when the real (backup) method itself threw. Distinguishes "the real
+    // implementation refused this call" from "our own hook body has a bug", so
+    // Hooker.callback() can propagate the former verbatim and fail safe on the latter.
+    var error: Throwable? = null
+        private set
+
     val thisObject: Any?
         get() = if (static) null else raw.getOrNull(0)
 
@@ -42,8 +48,20 @@ class Frame(
     fun proceed(): Any? {
         val backup = hooker.backup ?: throw IllegalStateException("no backup for ${member.name}")
         val params = if (static) raw else raw.copyOfRange(1, raw.size)
-        result = backup.invoke(thisObject, *params)
+        // Mark proceeded before invoking, not after: if the real method throws (e.g. a
+        // restricted-settings SecurityException), Hooker.callback()'s retry logic must not
+        // see proceeded==false and invoke the real method a second time. A second raw
+        // reflective call happens outside the original Binder transaction's calling identity
+        // and can silently succeed under a different (often more privileged) uid, producing a
+        // result that was never actually meant for the real caller.
         proceeded = true
+        try {
+            result = backup.invoke(thisObject, *params)
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            val cause = e.cause ?: e
+            error = cause
+            throw cause
+        }
         return result
     }
 }
@@ -59,8 +77,19 @@ class Hooker(private val member: Executable, private val body: (Frame) -> Unit) 
         try {
             body(frame)
         } catch (t: Throwable) {
-            Logx.e("hook body failed on ${member.name}", t)
-            if (!frame.proceeded) return frame.proceed()
+            if (!frame.proceeded) {
+                Logx.e("hook body failed on ${member.name} before reaching the real method", t)
+                return frame.proceed()
+            }
+            val real = frame.error
+            if (real != null) {
+                // The real implementation threw (e.g. a restricted-settings SecurityException)
+                // and the hook body chose not to -- or could not -- spoof around it. Propagate
+                // that exact exception once, rather than retrying under a different identity or
+                // silently returning null; stock Android (no hook at all) would also throw here.
+                throw real
+            }
+            Logx.e("hook body failed on ${member.name} after a successful real call", t)
         }
         val type = frame.returnType
         if (!frame.proceeded && frame.result == null && type != Void.TYPE && type.isPrimitive) {
